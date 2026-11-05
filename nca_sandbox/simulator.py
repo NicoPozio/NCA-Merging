@@ -185,14 +185,6 @@ class Simulator:
         has_c = fuel_c > p.eps
         burning = (fire > p.eps) & flam & has_c
         ignite = flam & has_c & (temp >= thr) & (hum <= p.t1_max_h_ignite)
-
-        #Radiant heat: an unlit flammable cell pulls heat from its hottest neighbour when that neighbour
-        #is above the cell's ignition threshold. Diffusion alone can never lift a cell above the mean
-        #of its neighbours, so without this term the fire does not spread
-        hot_n = neighbors(temp.unsqueeze(1))[:, 0].max(-1).values
-        radiate = flam & has_c & ~burning & (hot_n >= thr)
-        pull = radiate.float() * p.t1_radiate * (hot_n - temp).clamp(min=0)
-
         b = burning.float()
         n_burning = neighbors(b.unsqueeze(1))[:, 0].mean(-1) #share of neighbours on fire
         d[:, C] = -b * fuel_c.clamp(max=p.t1_c_burn)
@@ -229,8 +221,9 @@ class Simulator:
         w, temp, hum = s[:, W], s[:, T], s[:, H]
         soil = ctx["soil"]
         absorb_k = self._prop(ctx["mat"], self.absorb)
-
-        d[:, H] = p.t3_wet * torch.maximum(w, ctx["n_w"].mean(-1))
+        #a cell's own water wets it fully, water next door only up to t3_h_wet_max
+        near = (p.t3_wet * ctx["n_w"].mean(-1)).clamp(max=(p.t3_h_wet_max - hum).clamp(min=0))
+        d[:, H] = torch.maximum(p.t3_wet * w, near)
         #water cools only what is hotter than ambient, so a lake does not cool itself to zero and freeze
         d[:, T] = -p.t3_cool * w * (temp - p.t_amb).clamp(min=0)
 
@@ -283,10 +276,6 @@ class Simulator:
         temp = s[:, T]
         burning = (fire > p.eps) & (fuel > p.eps)
         ignite = (fuel >= p.t6_o_ignite) & (temp >= p.t6_t_ignite) & (s[:, H] <= p.t6_max_h_ignite)
-        #Same radiant pull as T1, for cells covered by fuel
-        hot_n = neighbors(temp.unsqueeze(1))[:, 0].max(-1).values
-        radiate = (fuel >= p.t6_o_ignite) & ~burning & (hot_n >= p.t6_t_ignite)
-        pull = radiate.float() * p.t6_radiate * (hot_n - temp).clamp(min=0)
         b = burning.float()
         n_burning = neighbors(b.unsqueeze(1))[:, 0].mean(-1)
         d[:, O] = -b * fuel.clamp(max=p.t6_o_burn)
@@ -304,7 +293,8 @@ class Simulator:
         d[:, T] = -lava.float() * temp.clamp(max=p.t7_cool) + p.t7_radiate * n_lava * (1 - temp) * (~lava).float()
         contact = lava & (ctx["n_w"].max(-1).values >= p.t7_w_contact)
         solid = lava & ((temp < p.t7_t_solid) | contact)
-        melt = (ctx["idx"] == STONE) & (temp >= p.t7_t_melt)
+        #only lava melts stone: fire, fuel and lightning also bring T near 1, but must not make lava
+        melt = (ctx["idx"] == STONE) & (temp >= p.t7_t_melt) & (n_lava > 0)
         d[:, V] = contact.float() * p.t7_vapor
         target = torch.full_like(ctx["idx"], -1)
         target = torch.where(solid, torch.full_like(target, STONE), target)

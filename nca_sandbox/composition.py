@@ -102,6 +102,8 @@ def chain_wind_meadow(size=32, p=None):
     def ind(traj):
         mid = traj[:31]
         return {"bruciato_sottovento": _burnt(mid, east), "bruciato_sopravento": _burnt(mid, west)}
+    return CompositionScene("prato_con_vento", "catena", ("T1", "T2"), cv.build(), events, 64,
+                            "l'incendio avanza sottovento", ind)
 
 
 def chain_bolt_fence_grass(size=32, p=None):

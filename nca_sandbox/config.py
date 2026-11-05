@@ -100,6 +100,8 @@ class SimParams:
     t3_thin: float = 0.05 #if the puddle is thinner than this, it disappears
     t3_t_evap: float = 0.6
     t3_evap: float = 0.1
+    #contact with water wets a cell only up to here, below t3_h_puddle: only rain makes new puddles
+    t3_h_wet_max: float = 0.9
 
     #Electricity
     t4_w_conduct: float = 0.2 #How much water we need on a cell to conduct

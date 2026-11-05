@@ -84,18 +84,28 @@ def masked_mse(pred, target, weights=None):
 @torch.no_grad()
 def make_val_set(cfg: TrainConfig, gen_cfg: GeneratorConfig):
     gen = SandboxGenerator(gen_cfg, device=cfg.device, seed=10_000 + cfg.seed)
-    return gen.sample(cfg.val_scenes, cfg.rules, steps=cfg.val_ticks, keep_info=False, size=cfg.size)
+    return gen.sample(cfg.val_scenes, cfg.rules, steps=cfg.val_ticks, keep_info=cfg.rules != "base", size=cfg.size)
 
 
 @torch.no_grad()
-def evaluate(model, val):
-    """Free rollout of the NCA over the whole validation horizon, compared with the simulator."""
+def evaluate(model, val, support_share=0.0):
+    """Free rollout of the NCA over the whole validation horizon, compared with the simulator.
+
+    val_mse_rule is the error on the cells where an active rule acts: for ice or lava they are well
+    under 1% of the cells, so val_mse alone hardly sees whether the specialist learned its rule.
+    val_score weighs the two like the training loss and picks the best checkpoint."""
     model.eval()
     pred = model.rollout(val.initial, val.trajectory.shape[1] - 1, val.event_masks)
-    err = ((pred[:, 1:, :WX] - val.trajectory[:, 1:, :WX]) ** 2).mean((0, 2, 3, 4))
+    sq = (pred[:, 1:, :WX] - val.trajectory[:, 1:, :WX]) ** 2
+    err = sq.mean((0, 2, 3, 4))
+    out = {"val_mse": float(err.mean()), "val_mse_t8": float(err[:8].mean()), "val_mse_last": float(err[-1])}
+    out["val_score"] = out["val_mse"]
+    if val.support is not None:
+        sup = (val.support & val.active[:, None, :, None, None]).any(2).unsqueeze(2)
+        out["val_mse_rule"] = float((sq * sup).sum() / (sup.sum() * sq.shape[2]).clamp(min=1))
+        out["val_score"] = (1 - support_share) * out["val_mse"] + support_share * out["val_mse_rule"]
     model.train()
-    return {"val_mse": float(err.mean()), "val_mse_t8": float(err[:8].mean()), "val_mse_last": float(err[-1])}
-
+    return out
 
 def build_model(init, model_cfg: NCAConfig, sim_params, device, seed):
     """init: 'random' or the path of a checkpoint to fine-tune from."""
@@ -209,13 +219,13 @@ def train(cfg: TrainConfig, init="random", model_cfg: NCAConfig = None, gen_cfg:
         if it % cfg.refresh_every == 0:
             pool.refresh(cfg.pool_refresh)
         if it % cfg.eval_every == 0 or it == cfg.iters:
-            metrics = evaluate(model, val)
+            metrics = evaluate(model, val, cfg.support_share)
             row = {"iter": it, "k": k, "loss": loss.item(), "lr": sched.get_last_lr()[0],
                    "time": round(time.time() - t_start, 1), **metrics}
             result.history.append(row)
             log(" ".join(f"{a}={b:.3g}" if isinstance(b, float) else f"{a}={b}" for a, b in row.items()))
-            if out is not None and metrics["val_mse"] < result.best_val:
-                result.best_val = metrics["val_mse"]
+            if out is not None and metrics["val_score"] < result.best_val:
+                result.best_val = metrics["val_score"]            
                 save_nca(Path(f"{out}_best.pt"), model, history=result.history, **meta)
         result.iteration = it
         if rpath is not None and it < cfg.iters:

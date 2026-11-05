@@ -5,7 +5,7 @@ import torch
 
 from nca_sandbox.composition import composition_suite, run_scene
 from nca_sandbox.config import (
-    W, E, F, ICE, H, METAL, N_RULES, R, T, T2, T4, T5, GROUND, WX, SimParams,
+    W, O, E, F, ICE, H, LAVA, METAL, N_RULES, R, STONE, T, T2, T3, T4, T5, T6, T7, GROUND, WX, SimParams,
 )
 from nca_sandbox.dataset import SandboxGenerator, Split, save_split
 from nca_sandbox.events import events_to_masks
@@ -178,6 +178,35 @@ def test_composition_scenes_run():
         traj, conf = run_scene(sc)
         assert traj.shape[0] == sc.steps + 1
         assert isinstance(sc.indicators(traj), dict)
+
+def test_lake_does_not_spread():
+    # senza pioggia un lago non deve allagare la pietra intorno
+    sim = Simulator()
+    yy, xx = torch.meshgrid(torch.arange(SIZE), torch.arange(SIZE), indexing="ij")
+    lake = ((yy - SIZE // 2) ** 2 + (xx - SIZE // 2) ** 2 <= 16).unsqueeze(0)
+    idx, f = _scene(STONE, h=0.15)
+    idx[lake] = GROUND
+    f[W] = lake.float()
+    x = assemble(idx, f, torch.zeros(1, 2), sim.p)
+    start = int((x[0, W] >= 0.2).sum())
+    for _ in range(256):
+        x, _ = sim.step(x, _only(T3), diagnostics=False)
+    assert int((x[0, W] >= 0.2).sum()) == start
+
+
+def test_only_lava_melts_stone():
+    # carburante in fiamme e fulmine scaldano la pietra oltre la soglia, ma non creano lava
+    sim = Simulator()
+    idx, f = _scene(STONE)
+    fuel = torch.zeros(1, SIZE, SIZE)
+    fuel[0, 5:11, 5:11] = 1.0
+    f[O] = fuel
+    x = assemble(idx, f, torch.zeros(1, 2), sim.p)
+    events = [(0, "accensione", (8, 8), {}), (0, "fulmine", (3, 12), {})]
+    masks = events_to_masks(events, 40, SIZE, SIZE).unsqueeze(0)
+    traj, _, _, _ = sim.rollout(x, _only(T6) | _only(T7), 40, masks, keep_info=False)
+    assert traj[0, :, T].max() > sim.p.t7_t_melt
+    assert not (traj[0, :, LAVA] > 0.5).any()
 
 
 if __name__ == "__main__":

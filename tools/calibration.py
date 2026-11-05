@@ -92,7 +92,7 @@ def trigger_rates(p, n=128, steps=64, seed=0):
     """Fraction of unbalanced random scenes in which each rule fires at least once."""
     gen = SandboxGenerator(GeneratorConfig(sim=p), seed=seed)
     b = gen.sample(n, "joint_full", steps=steps, keep_info=False, balance=False)
-    return b.triggers.float().mean(0)
+    return (b.triggers > 0).float().mean(0)
 
 
 def report(p):

@@ -50,15 +50,21 @@ def _run(name, out_dir, cfg, init, model_cfg, trainable="all"):
     return final
 
 
+def _arch(args):
+    """Name tag for a non-default network, so the width and activation variants never skip or
+    overwrite each other's checkpoints."""
+    return "" if (args.hidden, args.act) == (128, "relu") else f"_h{args.hidden}_{args.act}"
+
+
 def base_path(args):
-    return Path(args.base) if args.base else Path(args.out) / "base" / f"base_s{args.seed}.pt"
+    return Path(args.base) if args.base else Path(args.out) / "base" / f"base{_arch(args)}_s{args.seed}.pt"
 
 
 def run_group(group, args):
     model_cfg = NCAConfig(hidden=args.hidden, act=args.act)
     common = TrainConfig(batch=args.batch, seed=args.seed, size=args.size,
                          **({"device": args.device} if args.device else {}))
-    suffix = f"_s{args.seed}"
+    suffix = f"{_arch(args)}_s{args.seed}"
 
     if group == "base":
         cfg = replace(common, rules="base", iters=args.base_iters)
@@ -84,6 +90,7 @@ def run_group(group, args):
         cfg = replace(common, rules=group, iters=iters, ambiguity_mask=not args.no_ambiguity_mask)
         init = "random" if args.joint_init == "random" else str(base_path(args))
         tag = "_nomask" if group == "joint_single" and args.no_ambiguity_mask else ""
+        tag += "_rand" if args.joint_init == "random" else ""
         return [_run(f"{group}/{group}{tag}{suffix}", args.out, cfg, init, model_cfg)]
 
     raise ValueError(group)
