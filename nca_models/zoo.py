@@ -65,6 +65,8 @@ def run_group(group, args):
     common = TrainConfig(batch=args.batch, seed=args.seed, size=args.size,
                          **({"device": args.device} if args.device else {}))
     suffix = f"{_arch(args)}_s{args.seed}"
+    #one recipe for every model trained on the rules (specialists, scratch, joint): only the base keeps its lr
+    tuned = {"lr": args.lr, "lr_min": args.lr / 10, "k_max": args.k_max}
 
     if group == "base":
         cfg = replace(common, rules="base", iters=args.base_iters)
@@ -73,7 +75,7 @@ def run_group(group, args):
     if group in ("specialists", "scratch"):
         paths = []
         for rule in args.rules:
-            cfg = replace(common, rules=rule, iters=args.iters)
+            cfg = replace(common, rules=rule, iters=args.iters, **tuned)
             if group == "specialists":
                 init = base_path(args)
                 if not init.exists():
@@ -87,7 +89,7 @@ def run_group(group, args):
 
     if group in ("joint_single", "joint_full"):
         iters = args.joint_iters or args.iters * len(args.rules)
-        cfg = replace(common, rules=group, iters=iters, ambiguity_mask=not args.no_ambiguity_mask)
+        cfg = replace(common, rules=group, iters=iters, ambiguity_mask=not args.no_ambiguity_mask, **tuned)
         init = "random" if args.joint_init == "random" else str(base_path(args))
         tag = "_nomask" if group == "joint_single" and args.no_ambiguity_mask else ""
         tag += "_rand" if args.joint_init == "random" else ""
@@ -108,6 +110,8 @@ def main(argv=None):
     ap.add_argument("--act", default="relu", choices=("relu", "abs", "none"))
     ap.add_argument("--base-iters", type=int, default=20000)
     ap.add_argument("--iters", type=int, default=5000, help="steps per specialist")
+    ap.add_argument("--lr", type=float, default=1e-3, help="peak lr of specialists, scratch and joint models")
+    ap.add_argument("--k-max", type=int, default=64, help="longest training window of the same models")
     ap.add_argument("--joint-iters", type=int, default=None, help="default: --iters x number of rules")
     ap.add_argument("--rules", nargs="+", default=list(RULE_NAMES), choices=RULE_NAMES)
     ap.add_argument("--base", default=None, help="base checkpoint (default: <out>/base/base_s<seed>.pt)")
