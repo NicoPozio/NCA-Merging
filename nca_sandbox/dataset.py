@@ -162,14 +162,20 @@ def save_split(path, rules, n=500, steps=256, seed=0, size=32, device="cpu", chu
     """
     cfg = config or GeneratorConfig(size=size)
     g = SandboxGenerator(cfg, device=device, seed=seed)
-    parts = []
+    #every chunk keeps only what gets saved: concatenating the full trajectories would need ~10 GB
+    initial, events, active, triggers, last = [], [], [], [], []
     for start in range(0, n, chunk):
-        parts.append(g.sample(min(chunk, n - start), rules, steps, keep_info=False, size=size))
-    batch = Batch.cat(parts)
+        b = g.sample(min(chunk, n - start), rules, steps, keep_info=False, size=size)
+        initial.append(b.initial.cpu())
+        events += b.events
+        active.append(b.active.cpu())
+        triggers.append(b.triggers.cpu())
+        last.append(b.trajectory[:, -1].cpu())
+        del b
     data = {
         "rules": rules, "steps": steps, "size": size, "seed": seed,
-        "initial": batch.initial.cpu(), "events": batch.events, "active": batch.active.cpu(),
-        "triggers": batch.triggers.cpu(), "checksum": _checksum(batch.trajectory[:, -1]),
+        "initial": torch.cat(initial), "events": events, "active": torch.cat(active),
+        "triggers": torch.cat(triggers), "checksum": _checksum(torch.cat(last)),
         "sim_params": cfg.sim.to_dict(),
     }
     path = Path(path)
