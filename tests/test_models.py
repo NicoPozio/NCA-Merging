@@ -165,15 +165,30 @@ def test_finetune_starts_from_checkpoint():
 
 def test_zoo_all_groups():
     with tempfile.TemporaryDirectory() as tmp:
-        args = ["--out", tmp, "--size", str(SIZE), "--batch", "2", "--base-iters", "2", "--iters", "1",
-                "--rules", "T1", "T2", "--device", "cpu"]
+        args = ["--out", tmp, "--size", str(SIZE), "--batch", "2", "--base-iters", "2", "--iters", "3",
+                "--phase1-iters", "1", "--rules", "T1", "T2", "--device", "cpu"]
         for group in ("base", "specialists", "scratch", "joint_single", "joint_full"):
             zoo_main([group] + args)
-        names = sorted(p.relative_to(tmp).as_posix() for p in Path(tmp).rglob("*.pt") if "_best" not in p.name)
+        names = sorted(p.relative_to(tmp).as_posix() for p in Path(tmp).rglob("*.pt")
+                       if "_best" not in p.name and "_p1" not in p.name)
         assert names == ["base/base_s0.pt", "joint_full/joint_full_s0.pt", "joint_single/joint_single_s0.pt",
                          "scratch/T1_s0.pt", "scratch/T2_s0.pt", "specialists/T1_s0.pt", "specialists/T2_s0.pt"]
+        # two phases: one tick from the base, then rollouts from the end of phase 1
+        _, p1 = load_nca(Path(tmp) / "joint_single/joint_single_s0_p1.pt")
+        assert p1["train_cfg"]["iters"] == 2 and p1["train_cfg"]["k_max"] == 1 and p1["init"].endswith("base_s0.pt")
         _, ck = load_nca(Path(tmp) / "joint_single/joint_single_s0.pt")
-        assert ck["train_cfg"]["iters"] == 2 and ck["init"].endswith("base_s0.pt")
+        assert ck["train_cfg"]["iters"] == 4 and ck["train_cfg"]["lr"] == 1e-4
+        assert ck["init"].endswith("joint_single_s0_p1.pt")
+
+
+def test_zoo_rollout_only():
+    with tempfile.TemporaryDirectory() as tmp:
+        args = ["--out", tmp, "--size", str(SIZE), "--batch", "2", "--iters", "1", "--phase1-iters", "0",
+                "--rules", "T1", "--device", "cpu"]
+        zoo_main(["scratch"] + args)
+        assert not (Path(tmp) / "scratch/T1_s0_p1.pt").exists()
+        _, ck = load_nca(Path(tmp) / "scratch/T1_s0.pt")
+        assert ck["train_cfg"]["iters"] == 1 and ck["train_cfg"]["lr"] == 1e-3
 
 
 if __name__ == "__main__":

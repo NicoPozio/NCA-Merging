@@ -12,6 +12,10 @@ With --time-limit the run stops cleanly before the limit; launching the same com
 the finished models and resumes the interrupted one from <name>_resume.pt.
 Budgets: a specialist gets --iters steps; the joint models get one specialist budget per rule,
 so they see as many updates as all the specialists together.
+Every model trained on the rules (specialists, scratch, joint) uses the same two-phase recipe:
+phase 1 (--phase1-iters of the budget) learns the single tick (windows of 1 tick, loss weighted
+towards the cells where the rule acts), phase 2 (the rest) trains on rollouts at the low --phase2-lr.
+Rare rules (T4, T5) are not learned by rollout training alone. --phase1-iters 0 = rollout only.
 """
 
 import argparse
@@ -50,6 +54,19 @@ def _run(name, out_dir, cfg, init, model_cfg, trainable="all"):
     return final
 
 
+def _run_rules(name, out_dir, cfg, init, model_cfg, args, trainable="all", n_rules=1):
+    """Two-phase recipe: one tick first, then rollouts. Phase 1 ends in <name>_p1.pt."""
+    p1 = args.phase1_iters * n_rules
+    if p1 == 0:
+        return _run(name, out_dir, cfg, init, model_cfg, trainable)
+    if p1 >= cfg.iters:
+        raise ValueError(f"--phase1-iters x rules = {p1} must be below the budget {cfg.iters}")
+    one_tick = replace(cfg, iters=p1, k_min=1, k_max=1, self_start_prob=0.0, support_share=0.5)
+    init = str(_run(f"{name}_p1", out_dir, one_tick, init, model_cfg, trainable))
+    rollout = replace(cfg, iters=cfg.iters - p1, lr=args.phase2_lr, lr_min=args.phase2_lr / 10)
+    return _run(name, out_dir, rollout, init, model_cfg, trainable)
+
+
 def _arch(args):
     """Name tag for a non-default network, so the width and activation variants never skip or
     overwrite each other's checkpoints."""
@@ -65,7 +82,7 @@ def run_group(group, args):
     common = TrainConfig(batch=args.batch, seed=args.seed, size=args.size,
                          **({"device": args.device} if args.device else {}))
     suffix = f"{_arch(args)}_s{args.seed}"
-    #one recipe for every model trained on the rules (specialists, scratch, joint): only the base keeps its lr
+    # one recipe for every model trained on the rules (specialists, scratch, joint): only the base keeps its own
     tuned = {"lr": args.lr, "lr_min": args.lr / 10, "k_max": args.k_max}
 
     if group == "base":
@@ -81,10 +98,10 @@ def run_group(group, args):
                 if not init.exists():
                     raise FileNotFoundError(f"{init} not found: train the base first or pass --base")
                 tag = "_last" if args.trainable == "last" else ""
-                paths.append(_run(f"specialists/{rule}{tag}{suffix}", args.out, cfg, str(init), model_cfg,
-                                  args.trainable))
+                paths.append(_run_rules(f"specialists/{rule}{tag}{suffix}", args.out, cfg, str(init), model_cfg,
+                                        args, args.trainable))
             else:
-                paths.append(_run(f"scratch/{rule}{suffix}", args.out, cfg, "random", model_cfg))
+                paths.append(_run_rules(f"scratch/{rule}{suffix}", args.out, cfg, "random", model_cfg, args))
         return paths
 
     if group in ("joint_single", "joint_full"):
@@ -93,7 +110,8 @@ def run_group(group, args):
         init = "random" if args.joint_init == "random" else str(base_path(args))
         tag = "_nomask" if group == "joint_single" and args.no_ambiguity_mask else ""
         tag += "_rand" if args.joint_init == "random" else ""
-        return [_run(f"{group}/{group}{tag}{suffix}", args.out, cfg, init, model_cfg)]
+        return [_run_rules(f"{group}/{group}{tag}{suffix}", args.out, cfg, init, model_cfg, args,
+                           n_rules=len(args.rules))]
 
     raise ValueError(group)
 
@@ -112,6 +130,9 @@ def main(argv=None):
     ap.add_argument("--iters", type=int, default=5000, help="steps per specialist")
     ap.add_argument("--lr", type=float, default=1e-3, help="peak lr of specialists, scratch and joint models")
     ap.add_argument("--k-max", type=int, default=64, help="longest training window of the same models")
+    ap.add_argument("--phase1-iters", type=int, default=2000,
+                    help="one-tick steps per rule at the start of the budget (0 = rollout only)")
+    ap.add_argument("--phase2-lr", type=float, default=1e-4, help="peak lr of the rollout phase")
     ap.add_argument("--joint-iters", type=int, default=None, help="default: --iters x number of rules")
     ap.add_argument("--rules", nargs="+", default=list(RULE_NAMES), choices=RULE_NAMES)
     ap.add_argument("--base", default=None, help="base checkpoint (default: <out>/base/base_s<seed>.pt)")
