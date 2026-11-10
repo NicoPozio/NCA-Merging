@@ -183,9 +183,10 @@ def train(cfg: TrainConfig, init="random", model_cfg: NCAConfig = None, gen_cfg:
         opt.load_state_dict(ck["opt"])
         sched.load_state_dict(ck["sched"])
         result.history, result.best_val = ck["history"], ck["best_val"]
-        g.set_state(ck["rng"]["g"])
-        gen.gen.set_state(ck["rng"]["gen"])
-        gen.cpu_gen.set_state(ck["rng"]["cpu_gen"])
+        # RNG states are CPU byte tensors even for CUDA generators: map_location moved them to the GPU
+        g.set_state(ck["rng"]["g"].cpu())
+        gen.gen.set_state(ck["rng"]["gen"].cpu())
+        gen.cpu_gen.set_state(ck["rng"]["cpu_gen"].cpu())
         start_it = ck["iter"] + 1
         log(f"resumed from iteration {ck['iter']}")
 
