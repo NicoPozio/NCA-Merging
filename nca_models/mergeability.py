@@ -10,13 +10,24 @@ weights (task vector tau = specialist - base)
   to predict little and keep it as a reference);
 - top_overlap, sign_conflict: share of weights in the top 20% by |tau| of both rules, and among
   those the share with opposite sign (the trim and elect steps of TIES, paper 17);
-- sti_W1, sti_W2: singular task interference of the pair (paper 24), relative to the sum of the
-  singular values kept, so pairs with different norms can be compared;
+- sti_W1, sti_W2: singular task interference of the pair (paper 24) with the singular vectors
+  holding 95% of each norm, relative to the sum of the singular values kept, so pairs with
+  different norms can be compared (our variant);
+- sti_paper_W1, sti_paper_W2: the same as in paper 24, keeping a fixed share 1/T of the singular
+  vectors of every task as TSV-M does (T = number of rules) and with no normalization;
+- sub_left_*, sub_right_*: overlap of the top-k left and right singular subspaces of the two
+  dW, ||U_i^T U_j||_F^2 / k, in [0, 1] (subspace overlap of paper 23, same k as sti_paper);
   per rule also the effective rank of dW (how many directions the rule really uses).
 
-function (gradients at the base weights)
-- grad_cos: cosine between the gradients of the one-tick loss on the cells where rule i acts and
-  on the cells where rule j acts, both at the base weights (gradient similarity, paper 23);
+function (gradients)
+- grad_cos, grad_l2, grad_dot: gradients of the one-tick loss with respect to the weights, each
+  specialist at its own weights, on one calibration set shared by the two (states of scenes with
+  every rule active): cosine, L2 distance and dot product (encoder gradients of paper 23);
+- igrad_cos, igrad_l2, igrad_dot: the same with the gradients with respect to the input state
+  (input gradients of paper 23);
+- grad_cos_base: cosine between the gradients of the one-tick loss on the cells where rule i acts
+  and on the cells where rule j acts, both at the base weights: do the two rules ask the base to
+  move in the same direction (our variant, closer to gradient conflict in multi-task learning);
 - cross_leak: how much specialist j changes the update of the base on the cells where only rule
   i acts, relative to how much it changes it where its own rule acts, averaged over the two
   directions (weight disentanglement of paper 16, measured with the support mask);
@@ -93,7 +104,36 @@ def sti(mats, energy=0.95):
     return float(val / s.sum()) if s.sum() > 0 else float("nan")
 
 
-def weight_metrics(ti, tj, top=0.2, energy=0.95):
+def kept_rank(m, keep):
+    """Number of singular vectors a share `keep` of the smaller side gives (at least 1)."""
+    return max(1, int(min(m.shape) * keep))
+
+
+def sti_paper(mats, keep):
+    """STI as in paper 24: every task keeps the top share `keep` of its singular vectors (1/T in
+    TSV-M), no normalization: ||(U^T U - I) S (V^T V - I)||_1."""
+    us, ss, vs = [], [], []
+    for m in mats:
+        u, s, vh = torch.linalg.svd(m.double(), full_matrices=False)
+        k = kept_rank(m, keep)
+        us.append(u[:, :k])
+        ss.append(s[:k])
+        vs.append(vh[:k].T)
+    u, s, v = torch.cat(us, 1), torch.cat(ss), torch.cat(vs, 1)
+    eye = torch.eye(len(s), dtype=u.dtype)
+    return float(((u.T @ u - eye) @ torch.diag(s) @ (v.T @ v - eye)).abs().sum())
+
+
+def subspace_overlap(a, b, k):
+    """Overlap of the top-k left and right singular subspaces of two matrices, in [0, 1]."""
+    ua, _, vha = torch.linalg.svd(a.double(), full_matrices=False)
+    ub, _, vhb = torch.linalg.svd(b.double(), full_matrices=False)
+    left = float((ua[:, :k].T @ ub[:, :k]).pow(2).sum() / k)
+    right = float((vha[:k] @ vhb[:k].T).pow(2).sum() / k)
+    return left, right
+
+
+def weight_metrics(ti, tj, top=0.2, energy=0.95, keep=1 / N_RULES):
     a, b = _flat(ti), _flat(tj)
     ma, mb = top_mask(a, top), top_mask(b, top)
     both = ma & mb
@@ -104,6 +144,8 @@ def weight_metrics(ti, tj, top=0.2, energy=0.95):
         if k in ti:
             out[f"cos_{k}"] = _cos(ti[k].flatten(), tj[k].flatten())
             out[f"sti_{k}"] = sti([ti[k], tj[k]], energy)
+            out[f"sti_paper_{k}"] = sti_paper([ti[k], tj[k]], keep)
+            out[f"sub_left_{k}"], out[f"sub_right_{k}"] = subspace_overlap(ti[k], tj[k], kept_rank(ti[k], keep))
     return out
 
 
@@ -111,6 +153,7 @@ def _states(split, n, ticks, chunk, device):
     """Yields (state before the tick, event masks of the tick, active rules, simulator info,
     state after) for the first n scenes of a split, chunk by chunk and tick by tick."""
     sim = split.sim
+    n = min(n, len(split.data["initial"]))
     for start in range(0, n, chunk):
         idx = list(range(start, min(n, start + chunk)))
         x = split.data["initial"][idx].to(device)
@@ -146,6 +189,50 @@ def rule_gradient(model, split, rule, n=64, ticks=64, chunk=32, device="cpu"):
              for k, p in params.items()}
     model.zero_grad(set_to_none=True)
     return grads
+
+
+@torch.no_grad()
+def calibration_set(split, n=32, ticks=64, every=8, device="cpu"):
+    """States shared by every model for the gradient metrics: the first n scenes of the split
+    (the joint_full one, every rule active), one state every `every` ticks.
+    Returns (state, event masks, next state of the simulator), each stacked over the states."""
+    xs, ms, ys = [], [], []
+    t = 0
+    for x, m, _, _, nxt in _states(split, n, ticks, max(1, n), device):
+        if t % every == 0:
+            xs.append(x.cpu())
+            ms.append(m.cpu())
+            ys.append(nxt.cpu())
+        t = (t + 1) % ticks
+    return torch.cat(xs), torch.cat(ms), torch.cat(ys)
+
+
+def model_gradients(model, cal, chunk=64, device="cpu"):
+    """Gradients of the one-tick squared error on the calibration set (mean over cells and
+    channels W .. S) with respect to the weights and to the input state, at the weights of
+    `model`. Returns ({layer: tensor}, input gradient (N, 20, H, W))."""
+    model = model.to(device).train()
+    params = {k: getattr(model, k) for k in LAYERS if hasattr(model, k)}
+    for p in params.values():
+        p.requires_grad_(True)
+        p.grad = None
+    xs, ms, ys = cal
+    total = xs.shape[0] * xs.shape[-1] * xs.shape[-2] * WX
+    igrads = []
+    for start in range(0, xs.shape[0], chunk):
+        x = xs[start:start + chunk].to(device).requires_grad_(True)
+        pred = model(x, ms[start:start + chunk].to(device))
+        loss = ((pred[:, :WX] - ys[start:start + chunk].to(device)[:, :WX]) ** 2).sum() / total
+        loss.backward()
+        igrads.append(x.grad.detach().cpu())
+    grads = {k: p.grad.detach().float().cpu() for k, p in params.items()}
+    model.zero_grad(set_to_none=True)
+    return grads, torch.cat(igrads)
+
+
+def gradient_metrics(gi, gj, prefix):
+    a, b = gi.flatten().double(), gj.flatten().double()
+    return {f"{prefix}_cos": _cos(a, b), f"{prefix}_l2": float((a - b).norm()), f"{prefix}_dot": float(a @ b)}
 
 
 def _write_masks(sim, x, m, active):
@@ -225,15 +312,19 @@ def simulator_stats(split, specialists, base, n=64, ticks=64, chunk=16, device="
     return st
 
 
-def pair_table(task_vectors, grads, stats: SimStats, top=0.2, energy=0.95):
-    """One row per pair of rules (28 for 8 rules) with every metric."""
+def pair_table(task_vectors, base_grads, spec_grads, stats: SimStats, top=0.2, energy=0.95, keep=1 / N_RULES):
+    """One row per pair of rules (28 for 8 rules) with every metric.
+    base_grads: {rule: gradients at the base on the rule's cells}; spec_grads: {rule: (weight
+    gradients, input gradients) of the specialist on the shared calibration set}."""
     rows = []
     rules = [r for r in RULES if r in task_vectors]
     for ri, rj in itertools.combinations(rules, 2):
         i, j = RULE_IDS[ri], RULE_IDS[rj]
         row = {"pair": f"{ri}-{rj}", "rule_i": ri, "rule_j": rj}
-        row.update(weight_metrics(task_vectors[ri], task_vectors[rj], top, energy))
-        row["grad_cos"] = _cos(_flat(grads[ri]), _flat(grads[rj]))
+        row.update(weight_metrics(task_vectors[ri], task_vectors[rj], top, energy, keep))
+        row.update(gradient_metrics(_flat(spec_grads[ri][0]), _flat(spec_grads[rj][0]), "grad"))
+        row.update(gradient_metrics(spec_grads[ri][1], spec_grads[rj][1], "igrad"))
+        row["grad_cos_base"] = _cos(_flat(base_grads[ri]), _flat(base_grads[rj]))
         leak = []
         for a, b in ((i, j), (j, i)):
             if stats.change_on[b] > 0:
@@ -249,13 +340,14 @@ def pair_table(task_vectors, grads, stats: SimStats, top=0.2, energy=0.95):
     return rows
 
 
-def rule_table(task_vectors, grads, stats: SimStats, energy=0.95):
+def rule_table(task_vectors, base_grads, spec_grads, stats: SimStats, energy=0.95):
     """One row per rule: norms, effective ranks, locality, how rare the rule is."""
     rows = []
     total = float(stats.support.sum())
     for r, tv in task_vectors.items():
         k = RULE_IDS[r]
-        row = {"rule": r, "tau_norm": float(_flat(tv).norm()), "grad_norm": float(_flat(grads[r]).norm())}
+        row = {"rule": r, "tau_norm": float(_flat(tv).norm()), "grad_base_norm": float(_flat(base_grads[r]).norm()),
+               "grad_norm": float(_flat(spec_grads[r][0]).norm())}
         for m in MATRICES:
             if m in tv:
                 row[f"rank_{m}"] = effective_rank(tv[m], energy)

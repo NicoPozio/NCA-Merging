@@ -5,8 +5,9 @@
 Writes <out>/<tag>_pairs.csv (one row per pair, 28 for 8 rules) and <tag>_rules.csv (one row
 per rule), then prints both and the rank correlation between the metrics over the pairs, to see
 which ones say the same thing. The metrics are described in nca_models/mergeability.py.
-Gradients use the split of each rule, the simulator metrics the joint_full split (every rule
-active); both the validation split by default, so the test split stays untouched.
+The gradients at the base use the split of each rule; the gradients of the specialists, on one
+calibration set shared by all, and the simulator metrics use the joint_full split (every rule
+active). Everything uses the validation split by default, so the test split stays untouched.
 """
 
 import argparse
@@ -17,11 +18,15 @@ from pathlib import Path
 import torch
 
 from nca_models.evaluate import ensure_split, open_split
-from nca_models.mergeability import RULES, pair_table, rule_gradient, rule_table, simulator_stats, task_vector
+from nca_models.mergeability import (
+    RULES, calibration_set, model_gradients, pair_table, rule_gradient, rule_table, simulator_stats, task_vector,
+)
 from nca_models.model import load_nca
 
-PAIR_METRICS = ("cos", "cos_W1", "cos_W2", "top_overlap", "sign_conflict", "sti_W1", "sti_W2", "grad_cos",
-                "cross_leak", "support_jaccard", "support_overlap", "channel_cos", "cowrite")
+PAIR_METRICS = ("cos", "cos_W1", "cos_W2", "top_overlap", "sign_conflict", "sti_W1", "sti_W2", "sti_paper_W1",
+                "sti_paper_W2", "sub_left_W1", "sub_right_W1", "sub_left_W2", "sub_right_W2", "grad_cos", "grad_l2",
+                "grad_dot", "igrad_cos", "igrad_l2", "igrad_dot", "grad_cos_base", "cross_leak", "support_jaccard",
+                "support_overlap", "channel_cos", "cowrite")
 
 
 def spearman(a, b):
@@ -46,9 +51,9 @@ def write_csv(path, rows):
 
 def print_table(rows, key, cols):
     cols = [c for c in cols if c in rows[0]]
-    print(f"{key:8s} " + " ".join(f"{c[:11]:>11s}" for c in cols))
+    print(f"{key:8s} " + " ".join(f"{c:>15s}" for c in cols))
     for r in rows:
-        print(f"{r[key]:8s} " + " ".join(f"{r[c]:11.3g}" if isinstance(r[c], float) else f"{r[c]:>11}" for c in cols))
+        print(f"{r[key]:8s} " + " ".join(f"{r[c]:15.3g}" if isinstance(r[c], float) else f"{r[c]:>15}" for c in cols))
 
 
 def main(argv=None):
@@ -63,7 +68,11 @@ def main(argv=None):
     ap.add_argument("--n", type=int, default=64, help="scenes per split")
     ap.add_argument("--ticks", type=int, default=64)
     ap.add_argument("--top", type=float, default=0.2, help="share of weights kept for the sign metrics")
-    ap.add_argument("--energy", type=float, default=0.95, help="share of the norm kept by the SVD")
+    ap.add_argument("--energy", type=float, default=0.95, help="share of the norm kept by the SVD (our STI)")
+    ap.add_argument("--keep", type=float, default=None,
+                    help="share of singular vectors kept by the paper STI and the subspace overlap (default 1/rules)")
+    ap.add_argument("--cal-n", type=int, default=32, help="scenes of the calibration set")
+    ap.add_argument("--cal-every", type=int, default=8, help="one calibration state every this many ticks")
     ap.add_argument("--out", default="results/mergeability")
     ap.add_argument("--tag", default=None, help="default: the run folder of the specialists")
     ap.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
@@ -82,17 +91,20 @@ def main(argv=None):
     size = base_meta["train_cfg"]["size"]
     tvs = {r: task_vector(m, base) for r, m in specs.items()}
 
-    grads = {}
+    keep = args.keep or 1 / len(args.rules)
+    base_grads = {}
     for r in args.rules:
         sp = open_split(ensure_split(args.splits_dir, r, args.split, size, device=args.device), args.device)
-        grads[r] = rule_gradient(base, sp, r, args.n, args.ticks, device=args.device)
-        print(f"gradient {r}: norm {float(torch.cat([g.flatten() for g in grads[r].values()]).norm()):.3g}")
+        base_grads[r] = rule_gradient(base, sp, r, args.n, args.ticks, device=args.device)
 
     joint = open_split(ensure_split(args.splits_dir, "joint_full", args.split, size, device=args.device), args.device)
+    cal = calibration_set(joint, args.cal_n, args.ticks, args.cal_every, args.device)
+    print(f"calibration set: {cal[0].shape[0]} states")
+    spec_grads = {r: model_gradients(m, cal, device=args.device) for r, m in specs.items()}
     stats = simulator_stats(joint, specs, base, args.n, args.ticks, device=args.device)
 
-    pairs = pair_table(tvs, grads, stats, args.top, args.energy)
-    rules = rule_table(tvs, grads, stats, args.energy)
+    pairs = pair_table(tvs, base_grads, spec_grads, stats, args.top, args.energy, keep)
+    rules = rule_table(tvs, base_grads, spec_grads, stats, args.energy)
     out = Path(args.out)
     write_csv(out / f"{tag}_pairs.csv", pairs)
     write_csv(out / f"{tag}_rules.csv", rules)
@@ -102,11 +114,12 @@ def main(argv=None):
     print("\npairs")
     print_table(pairs, "pair", PAIR_METRICS)
     cols = [c for c in PAIR_METRICS if c in pairs[0]]
-    print("\nrank correlation between metrics over the pairs (|rho| near 1 = they say the same thing)")
-    print(f"{'':16s}" + " ".join(f"{c[:7]:>7s}" for c in cols))
-    for a in cols:
+    print("\nrank correlation between metrics over the pairs (|rho| near 1 = they say the same thing);")
+    print("columns are numbered as the rows")
+    print(f"{'':20s}" + " ".join(f"{i:>5d}" for i in range(1, len(cols) + 1)))
+    for i, a in enumerate(cols, 1):
         va = [p[a] for p in pairs]
-        print(f"{a:16s}" + " ".join(f"{spearman(va, [p[b] for p in pairs]):7.2f}" for b in cols))
+        print(f"{i:2d} {a:17s}" + " ".join(f"{spearman(va, [p[b] for p in pairs]):5.2f}" for b in cols))
     print(f"\nsaved {out / f'{tag}_pairs.csv'} and {out / f'{tag}_rules.csv'}")
     return pairs, rules
 

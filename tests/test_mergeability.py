@@ -7,7 +7,8 @@ import torch
 
 from nca_models.evaluate import open_split
 from nca_models.mergeability import (
-    effective_rank, rule_gradient, simulator_stats, sti, task_vector, top_mask, weight_metrics,
+    calibration_set, effective_rank, model_gradients, rule_gradient, simulator_stats, sti, sti_paper,
+    subspace_overlap, task_vector, top_mask, weight_metrics,
 )
 from nca_models.model import NCA, save_nca
 from nca_models.train import TrainConfig
@@ -50,6 +51,20 @@ def test_sti_orthogonal_vs_shared():
     assert sti([a, a]) > 0.5
 
 
+def test_sti_paper_and_subspace_overlap():
+    q, _ = torch.linalg.qr(torch.randn(16, 16))
+    p, _ = torch.linalg.qr(torch.randn(12, 12))
+    a = 3 * torch.outer(q[:, 0], p[:, 0])
+    b = 2 * torch.outer(q[:, 1], p[:, 1])
+    assert sti_paper([a, b], 1 / 12) < 1e-9
+    # the paper STI grows with the norm, ours does not
+    assert abs(sti_paper([a, 2 * a], 1 / 12) / sti_paper([a, a], 1 / 12) - 1.5) < 1e-6
+    assert abs(sti([a, 2 * a]) - sti([a, a])) < 1e-6
+    assert max(subspace_overlap(a, b, 1)) < 1e-12
+    left, right = subspace_overlap(a, 5 * a, 1)
+    assert abs(left - 1) < 1e-9 and abs(right - 1) < 1e-9
+
+
 def test_weight_metrics_signs():
     torch.manual_seed(0)
     ti = {"W1": torch.randn(8, 6), "b1": torch.randn(8), "W2": torch.randn(4, 8), "b2": torch.randn(4)}
@@ -79,6 +94,10 @@ def test_rule_gradient_and_simulator_stats():
         assert (st.cowrite <= st.inter + 1e-9).all()
         assert st.change_on[0] == 0 and st.change_off[0] == 0
         assert st.change_off[2] > 0
+        cal = calibration_set(open_split(Path(tmp) / "jf.pt"), n=4, ticks=STEPS, every=4)
+        assert cal[0].shape[0] == 4 * (STEPS // 4)
+        gw, gx = model_gradients(_noisy(base, 2), cal)
+        assert set(gw) == {"W1", "b1", "W2", "b2"} and gx.shape == cal[0].shape and gx.abs().sum() > 0
 
 
 def test_spearman():
@@ -99,6 +118,8 @@ def test_cli_end_to_end():
                                    "T1", "T2", "T3", "--splits-dir", str(splits), "--n", "4", "--ticks", str(STEPS),
                                    "--out", f"{tmp}/out", "--device", "cpu"])
         assert [p["pair"] for p in pairs] == ["T1-T2", "T1-T3", "T2-T3"] and len(rules) == 3
+        for key in ("grad_cos", "grad_l2", "igrad_dot", "grad_cos_base", "sti_paper_W2", "sub_right_W1"):
+            assert key in pairs[0]
         assert Path(tmp, "out/runs2_pairs.csv").exists() and Path(tmp, "out/runs2_rules.csv").exists()
         tv = task_vector(_noisy(base, 0), base)
         assert set(tv) == {"W1", "b1", "W2", "b2"}
