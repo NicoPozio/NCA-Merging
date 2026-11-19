@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Model merging of Neural Cellular Automata on a physics sandbox"
 requires-python = ">=3.12"
 dependencies = [
+    "matplotlib>=3.11.2",
     "torch>=2.1",
 ]
 

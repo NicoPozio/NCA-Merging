@@ -16,6 +16,8 @@ Every model trained on the rules (specialists, scratch, joint) uses the same two
 phase 1 (--phase1-iters of the budget) learns the single tick (windows of 1 tick, loss weighted
 towards the cells where the rule acts), phase 2 (the rest) trains on rollouts at the low --phase2-lr.
 Rare rules (T4, T5) are not learned by rollout training alone. --phase1-iters 0 = rollout only.
+With --p1-from DIR phase 1 is not trained again but taken from DIR (same names), after checking that
+it was trained with the same settings: this is how a sweep on phase 2 reuses the earlier phase 1.
 """
 
 import argparse
@@ -24,10 +26,12 @@ import time
 from dataclasses import replace
 from pathlib import Path
 
+import torch
+
 from nca_sandbox.config import N_RULES
 
 from .model import NCAConfig
-from .train import TrainConfig, resume_path, train
+from .train import TrainConfig, _comparable, resume_path, train
 
 RULE_NAMES = tuple(f"T{i + 1}" for i in range(N_RULES))
 GROUPS = ("base", "specialists", "scratch", "joint_single", "joint_full")
@@ -62,9 +66,35 @@ def _run_rules(name, out_dir, cfg, init, model_cfg, args, trainable="all", n_rul
     if p1 >= cfg.iters:
         raise ValueError(f"--phase1-iters x rules = {p1} must be below the budget {cfg.iters}")
     one_tick = replace(cfg, iters=p1, k_min=1, k_max=1, self_start_prob=0.0, support_share=0.5)
-    init = str(_run(f"{name}_p1", out_dir, one_tick, init, model_cfg, trainable))
+    if args.p1_from:
+        init = str(_reuse_p1(Path(args.p1_from) / f"{name}_p1.pt", one_tick, init, model_cfg, trainable))
+    else:
+        init = str(_run(f"{name}_p1", out_dir, one_tick, init, model_cfg, trainable))
     rollout = replace(cfg, iters=cfg.iters - p1, lr=args.phase2_lr, lr_min=args.phase2_lr / 10)
     return _run(name, out_dir, rollout, init, model_cfg, trainable)
+
+
+def _reuse_p1(path, one_tick, init, model_cfg, trainable):
+    """Phase 1 does not depend on the phase 2 settings, so a sweep on phase 2 can start from the
+    phase 1 checkpoints of an earlier run. We only accept them if they were trained exactly as this
+    run would train them (the device may differ)."""
+    if not path.exists():
+        raise FileNotFoundError(f"{path} not found: --p1-from must point to the --out of an earlier run")
+    ck = torch.load(path, map_location="cpu", weights_only=False)
+    expected = _comparable(one_tick)
+    found = {k: v for k, v in ck["train_cfg"].items() if k != "device"}
+    diff = {k: (found.get(k), v) for k, v in expected.items() if found.get(k) != v}
+    if Path(ck["init"]).name != Path(init).name:
+        diff["init"] = (ck["init"], init)
+    if ck["trainable"] != trainable:
+        diff["trainable"] = (ck["trainable"], trainable)
+    if ck["model_cfg"] != model_cfg.to_dict():
+        diff["model_cfg"] = (ck["model_cfg"], model_cfg.to_dict())
+    if diff:
+        lines = "\n".join(f"  {k}: found {a}, expected {b}" for k, (a, b) in diff.items())
+        raise ValueError(f"{path} was trained with different phase 1 settings:\n{lines}")
+    print(f"== phase 1 reused from {path}")
+    return path
 
 
 def _arch(args):
@@ -133,6 +163,8 @@ def main(argv=None):
     ap.add_argument("--phase1-iters", type=int, default=2000,
                     help="one-tick steps per rule at the start of the budget (0 = rollout only)")
     ap.add_argument("--phase2-lr", type=float, default=1e-4, help="peak lr of the rollout phase")
+    ap.add_argument("--p1-from", default=None,
+                    help="--out of an earlier run: take the phase 1 checkpoints from there instead of training them")
     ap.add_argument("--joint-iters", type=int, default=None, help="default: --iters x number of rules")
     ap.add_argument("--rules", nargs="+", default=list(RULE_NAMES), choices=RULE_NAMES)
     ap.add_argument("--base", default=None, help="base checkpoint (default: <out>/base/base_s<seed>.pt)")
