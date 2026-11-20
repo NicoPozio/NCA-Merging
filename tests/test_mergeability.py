@@ -10,10 +10,10 @@ from nca_models.mergeability import (
     calibration_set, effective_rank, model_gradients, rule_gradient, simulator_stats, sti, sti_paper,
     subspace_overlap, task_vector, top_mask, weight_metrics,
 )
+from tools.mergeability import main as merge_main, spearman, starts_from
 from nca_models.model import NCA, save_nca
 from nca_models.train import TrainConfig
 from nca_sandbox.dataset import save_split
-from tools.mergeability import main as merge_main, spearman
 
 SIZE = 12
 STEPS = 16
@@ -73,6 +73,16 @@ def test_weight_metrics_signs():
     neg = weight_metrics(ti, opposite)
     assert abs(same["cos"] - 1) < 1e-6 and same["sign_conflict"] == 0 and same["top_overlap"] == 1
     assert abs(neg["cos"] + 1) < 1e-6 and neg["sign_conflict"] == 1
+
+def test_starts_from_follows_phase1():
+    with tempfile.TemporaryDirectory() as tmp:
+        base = NCA()
+        bp = _save(Path(tmp) / "runs/base/base_s0.pt", base, "base")
+        p1 = _save(Path(tmp) / "runs2/specialists/T1_s0_p1.pt", base, "T1", init=str(bp))
+        final = _save(Path(tmp) / "runs2/specialists/T1_s0_best.pt", base, "T1", init=str(p1))
+        other = _save(Path(tmp) / "runs2/scratch/T1_s0_best.pt", base, "T1")
+        assert starts_from(final, bp) is True
+        assert starts_from(other, bp) is False
 
 
 def test_top_mask_share():

@@ -56,6 +56,23 @@ def print_table(rows, key, cols):
         print(f"{r[key]:8s} " + " ".join(f"{r[c]:15.3g}" if isinstance(r[c], float) else f"{r[c]:>15}" for c in cols))
 
 
+def starts_from(path, base, depth=4):
+    """True if the checkpoint was trained from `base`, following the chain of inits (a specialist
+    starts from its phase 1 checkpoint, which starts from the base). Only file names are compared,
+    so the check also works when the runs were moved; a link that cannot be opened counts as unknown."""
+    path = Path(path)
+    for _ in range(depth):
+        init = torch.load(path, map_location="cpu", weights_only=False).get("init")
+        if init is None or init == "random":
+            return False
+        if Path(init).name == Path(base).name:
+            return True
+        nxt = path.parent / Path(init).name
+        if not nxt.exists():
+            return None
+        path = nxt
+    return None
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Mergeability metrics of every pair of specialists.")
     ap.add_argument("--base", required=True)
@@ -85,8 +102,11 @@ def main(argv=None):
     for r in args.rules:
         path = spec_dir / f"{r}_s{args.seed}{'_best' if args.which == 'best' else ''}.pt"
         model, meta = load_nca(path, args.device)
-        if Path(str(meta.get("init"))).name != Path(args.base).name:
-            print(f"warning: {path} was trained from {meta.get('init')}, not from {args.base}")
+        origin = starts_from(path, args.base)
+        if origin is False:
+            print(f"warning: {path} was not trained from {args.base}: its task vector is not meaningful")
+        elif origin is None:
+            print(f"warning: could not follow the inits of {path} back to {args.base}")
         specs[r] = model
     size = base_meta["train_cfg"]["size"]
     tvs = {r: task_vector(m, base) for r, m in specs.items()}
@@ -122,7 +142,6 @@ def main(argv=None):
         print(f"{i:2d} {a:17s}" + " ".join(f"{spearman(va, [p[b] for p in pairs]):5.2f}" for b in cols))
     print(f"\nsaved {out / f'{tag}_pairs.csv'} and {out / f'{tag}_rules.csv'}")
     return pairs, rules
-
 
 if __name__ == "__main__":
     main()

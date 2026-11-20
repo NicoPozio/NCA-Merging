@@ -7,6 +7,16 @@ returns the merged weights as base + something built from the taus:
     average   base + sum_i w_i tau_i with sum_i w_i = 1 (uniform by default): the plain mean of
               the specialists, the gentlest method on emergent capabilities (paper 25)
     ta        base + alpha * sum_i tau_i, or one alpha per rule (task arithmetic, paper 15)
+    ties      trim every tau to its top k share by magnitude, elect the sign of every weight by
+              the summed mass, average only the values that agree with it (disjoint mean), then
+              base + lam * merged (TIES, paper 17)
+    dare      drop a random share p of every tau and rescale the rest by 1 / (1 - p), then task
+              arithmetic with alpha (DARE + TA, paper 18); the drop is seeded, so it is repeatable
+    tsv       for every weight matrix: SVD of every tau, keep the top 1/T of the singular vectors
+              of each (T = number of rules), make all the kept left and right vectors orthogonal
+              with the closest orthogonal matrix (Procrustes), rebuild and add alpha times it to
+              the base; vectors (biases) take the mean of the taus times alpha (TSV-M, paper 24,
+              which uses alpha = 1)
 
 A new method is a function (base_sd, taus, **hp) -> state dict registered in MERGERS, so the
 merging script, the checkpoints and the evaluation do not change when TIES, DARE or TSV arrive.
@@ -58,7 +68,71 @@ def merge_ta(base_sd, taus, alpha=1.0):
     return _combine(base_sd, taus, coef)
 
 
-MERGERS = {"average": merge_average, "ta": merge_ta}
+def _flat_keys(base_sd):
+    return [k for k, v in base_sd.items() if v.is_floating_point()]
+
+
+def merge_ties(base_sd, taus, k=0.2, lam=1.0):
+    keys = _flat_keys(base_sd)
+    shapes = [base_sd[key].shape for key in keys]
+    flat = torch.stack([torch.cat([tv[key].flatten() for key in keys]) for tv in taus.values()])   # (T, P)
+    trimmed = torch.zeros_like(flat)
+    keep = max(1, int(round(k * flat.shape[1])))
+    for i in range(flat.shape[0]):
+        idx = flat[i].abs().topk(keep).indices
+        trimmed[i, idx] = flat[i, idx]
+    sign = torch.sign(trimmed.sum(0))
+    agree = (torch.sign(trimmed) == sign) & (trimmed != 0)
+    merged = (trimmed * agree).sum(0) / agree.sum(0).clamp(min=1)
+    out = {key: v.clone() for key, v in base_sd.items()}
+    start = 0
+    for key, shape in zip(keys, shapes):
+        n = shape.numel()
+        out[key] += lam * merged[start:start + n].view(shape)
+        start += n
+    return out
+
+
+def merge_dare(base_sd, taus, p=0.3, alpha=0.5, seed=0):
+    gen = torch.Generator().manual_seed(seed)
+    dropped = {}
+    for rule, tv in taus.items():
+        dropped[rule] = {}
+        for key, t in tv.items():
+            mask = (torch.rand(t.shape, generator=gen) >= p).to(t.dtype)
+            dropped[rule][key] = t * mask / (1 - p)
+    return merge_ta(base_sd, dropped, alpha)
+
+
+def _closest_orthogonal(m):
+    """Orthogonal matrix closest to m (Procrustes): P Q^T from the SVD m = P S Q^T."""
+    p_, _, qh = torch.linalg.svd(m, full_matrices=False)
+    return p_ @ qh
+
+
+def merge_tsv(base_sd, taus, alpha=1.0, keep=None):
+    t = len(taus)
+    keep = keep or 1 / t
+    out = {key: v.clone() for key, v in base_sd.items()}
+    for key in _flat_keys(base_sd):
+        mats = [tv[key].double() for tv in taus.values()]
+        if mats[0].dim() != 2:
+            out[key] += alpha * (sum(mats) / t).to(out[key].dtype)
+            continue
+        r = max(1, int(min(mats[0].shape) * keep))
+        us, ss, vs = [], [], []
+        for m in mats:
+            u, s, vh = torch.linalg.svd(m, full_matrices=False)
+            us.append(u[:, :r])
+            ss.append(s[:r])
+            vs.append(vh[:r].T)
+        u, s, v = torch.cat(us, 1), torch.cat(ss), torch.cat(vs, 1)
+        rebuilt = _closest_orthogonal(u) @ torch.diag(s) @ _closest_orthogonal(v).T
+        out[key] += alpha * rebuilt.to(out[key].dtype)
+    return out
+
+
+MERGERS = {"average": merge_average, "ta": merge_ta, "ties": merge_ties, "dare": merge_dare, "tsv": merge_tsv}
 
 
 def merge(base_model, taus, method, **hp):

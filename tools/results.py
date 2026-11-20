@@ -157,8 +157,12 @@ def cmd_plot(args):
         if not sel:
             raise SystemExit(f"no records on {args.dataset} with n={args.n}: run eval first")
         if args.kind == "curves":
-            path = out / f"curves_{args.dataset}_{args.metric}.png"
-            plot_curves(sel, path, args.metric, f"{args.dataset}: {args.metric} vs tick ({args.split})")
+            metric = args.metric
+            if metric == "mse_rule" and all(float(r["rule_cnt"].sum()) == 0 for r in sel):
+                # no rule acts on this dataset (the base): show the error on every cell instead
+                metric = "mse_all"
+            path = out / f"curves_{args.dataset}_{metric}.png"
+            plot_curves(sel, path, metric, f"{args.dataset}: {metric} vs tick ({args.split})")
         else:
             path = out / f"drift_{args.dataset}.png"
             plot_drift(sel, args.channels, path, f"{args.dataset}: mean value, NCA vs simulator")
