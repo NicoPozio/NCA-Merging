@@ -207,6 +207,9 @@ def default_datasets(rules):
     dynamics); the joint models and the base on everything."""
     if rules in ("joint_single", "joint_full", "base"):
         return ["base"] + [f"T{i}" for i in range(1, 9)] + ["joint_full"]
+    if "+" in rules:
+        # a merge of some rules: the scenes where exactly those rules are active, then each alone
+        return [rules] + rules.split("+")
     return [rules, "base"]
 
 
